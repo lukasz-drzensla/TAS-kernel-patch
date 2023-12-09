@@ -1,0 +1,238 @@
+diff --git a/drivers/hwmon/coretemp.c b/drivers/hwmon/coretemp.c
+index bb9211215..bc71eaeec 100644
+--- a/drivers/hwmon/coretemp.c
++++ b/drivers/hwmon/coretemp.c
+@@ -5,6 +5,7 @@
+  * Copyright (C) 2007 Rudolf Marek <r.marek@assembler.cz>
+  *
+  * Inspired from many hwmon drivers
++ * Modified in 2023 by Lukasz Drzensla <drzensla@student.agh.edu.pl> to suit the needs of TAS (Temperature Aware Scheduling)
+  */
+ 
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+@@ -28,6 +29,25 @@
+ #include <asm/processor.h>
+ #include <asm/cpu_device_id.h>
+ 
++#include <linux/temp_aware_sched.h>
++
++/*TAS defines, functions prototypes and variables*/
++#define MILI_SECS_TO_JIFFIES(MILISECS) (MILISECS * HZ / 1000000)
++
++void TAS_read_temp(int core_num);
++struct temp_data *TAS_thermal_cores[TAS_NUMBER_OF_CORES] = { NULL };
++void TAS_init_read_temp_timer(void);
++static struct timer_list TAS_temp_read_timer;
++
++int TAS_temperatures_of_cores[TAS_NUMBER_OF_CORES] = { 0 };
++extern int TAS_coolest_cpu;
++
++#ifdef TAS_DEBUG
++extern int TAS_reschedules;
++#endif
++
++/*end of TAS section*/
++
+ #define DRVNAME	"coretemp"
+ 
+ /*
+@@ -147,6 +167,69 @@ static ssize_t show_ttarget(struct device *dev,
+ 	return sprintf(buf, "%d\n", pdata->core_data[attr->index]->ttarget);
+ }
+ 
++
++void TAS_temp_read_timer_callback(struct timer_list *timer)
++{
++	int i;
++	int lowest;
++	lowest = TAS_temperatures_of_cores[0];
++#ifdef TAS_DEBUG
++	printk(KERN_INFO "Scheduler reschedules between measuring is: %d",
++	       TAS_reschedules);
++	TAS_reschedules = 0;
++#endif
++
++	for (i = 0; i < TAS_NUMBER_OF_CORES; i++) {
++		TAS_read_temp(i);
++		if (TAS_temperatures_of_cores[i] < lowest) {
++			lowest = TAS_temperatures_of_cores[i];
++			TAS_coolest_cpu = i;
++		}
++	}
++
++	mod_timer(&TAS_temp_read_timer,
++		  jiffies + MILI_SECS_TO_JIFFIES(TAS_UPDATE_MILI_SECONDS));
++}
++
++void TAS_init_read_temp_timer(void)
++{
++	printk(KERN_INFO "TAS: Init temp read timer, every: %d[ms]\n",
++	       TAS_UPDATE_MILI_SECONDS);
++	timer_setup(&TAS_temp_read_timer, TAS_temp_read_timer_callback, 0);
++	mod_timer(&TAS_temp_read_timer,
++		  jiffies + MILI_SECS_TO_JIFFIES(TAS_UPDATE_MILI_SECONDS));
++}
++
++void TAS_read_temp(int core_num)
++{
++	u32 eax, edx;
++	struct temp_data *tdata = TAS_thermal_cores[core_num];
++
++	mutex_lock(&tdata->update_lock);
++
++	/* Check whether the time interval has elapsed */
++
++	if (!tdata->valid ||
++	    time_after(jiffies,
++		       tdata->last_updated +
++			       MILI_SECS_TO_JIFFIES(TAS_UPDATE_MILI_SECONDS))) {
++		rdmsr_on_cpu(tdata->cpu, tdata->status_reg, &eax, &edx);
++		/*
++		 * Ignore the valid bit. In all observed cases the register
++		 * value is either low or zero if the valid bit is 0.
++		 * Return it instead of reporting an error which doesn't
++		 * really help at all.
++		 */
++		tdata->temp = tdata->tjmax - ((eax >> 16) & 0x7f) * 1000;
++		tdata->valid = true;
++		tdata->last_updated = jiffies;
++	}
++
++	mutex_unlock(&tdata->update_lock);
++
++	TAS_temperatures_of_cores[core_num] = tdata->temp;
++}
++
+ static ssize_t show_temp(struct device *dev,
+ 			struct device_attribute *devattr, char *buf)
+ {
+@@ -496,6 +579,16 @@ static int create_core_data(struct platform_device *pdev, unsigned int cpu,
+ 
+ 	pdata->core_data[attr_no] = tdata;
+ 
++		if (!pkg_flag) {
++		TAS_thermal_cores[attr_no-2] = tdata;
++		if (TAS_NUMBER_OF_CORES == attr_no-1) {
++#ifdef TAS_DEBUG
++			TAS_reschedules = 0;
++#endif
++			TAS_init_read_temp_timer();
++		}
++	}
++
+ 	/* Create sysfs interfaces */
+ 	err = create_core_attrs(tdata, pdata->hwmon_dev, attr_no);
+ 	if (err)
+diff --git a/include/linux/temp_aware_sched.h b/include/linux/temp_aware_sched.h
+new file mode 100644
+index 000000000..ca327e3f7
+--- /dev/null
++++ b/include/linux/temp_aware_sched.h
+@@ -0,0 +1,13 @@
++#ifndef _TEMP_AWARE_SCHED_H_
++#define _TEMP_AWARE_SCHED_H_
++
++#define TAS_NUMBER_OF_CORES 4
++#define TAS_UPDATE_MILI_SECONDS 10
++
++#ifdef CONFIG_SCHED_SMT
++#define SMT_COEFF 2
++#else
++#define SMT_COEFF 1
++#endif
++
++#endif /*_TEMP_AWARE_SCHED_H_*/
+diff --git a/kernel/sched/MuQSS.c b/kernel/sched/MuQSS.c
+index eaba90172..91acf504d 100644
+--- a/kernel/sched/MuQSS.c
++++ b/kernel/sched/MuQSS.c
+@@ -30,6 +30,7 @@
+  *  2016-10-01  Multiple Queue Skiplist Scheduler scalable evolution of BFS
+  * 		scheduler by Con Kolivas.
+  *  2019-08-31  LLC bits by Eduards Bezverhijs
++ *  2023-10-08	 TAS tweaks by Lukasz Drzensla <drzensla@student.agh.edu.pl>
+  */
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/sched.h>
+@@ -72,6 +73,20 @@
+ #include "MuQSS.h"
+ #include "smp.h"
+ 
++#include <linux/temp_aware_sched.h>
++
++/*TAS variables and function prototypes*/
++int TAS_coolest_cpu = 0;
++void TAS_set_coolest_as_idle(void);
++#ifdef TAS_DEBUG
++int TAS_reschedules = 0;
++EXPORT_SYMBOL(TAS_reschedules);
++#endif
++
++EXPORT_SYMBOL(TAS_coolest_cpu);
++
++/*end of TAS variables and function prototypes*/
++
+ #define rt_prio(prio)		unlikely((prio) < MAX_RT_PRIO)
+ #define rt_task(p)		rt_prio((p)->prio)
+ #define batch_task(p)		(unlikely((p)->policy == SCHED_BATCH))
+@@ -123,7 +138,7 @@
+ 
+ void print_scheduler_version(void)
+ {
+-	printk(KERN_INFO "MuQSS CPU scheduler v0.210 by Con Kolivas.\n");
++	printk(KERN_INFO "MuQSS CPU scheduler v0.210 by Con Kolivas. With TAS tweaks by Lukasz Drzensla\n");
+ }
+ 
+ /*
+@@ -1052,6 +1067,20 @@ static bool suitable_idle_cpus(struct task_struct *p)
+ 	return (cpumask_intersects(p->cpus_ptr, &cpu_idle_map));
+ }
+ 
++/*SMT_COEFF is used to calculate physical cpu number when given logical cpu number. Currently only 2 logical threads per core are supported*/
++#ifdef CONFIG_SCHED_SMT
++__always_inline void TAS_set_coolest_as_idle(void)
++{
++	set_cpuidle_map(TAS_coolest_cpu * SMT_COEFF);
++	set_cpuidle_map(TAS_coolest_cpu * SMT_COEFF + 1);
++}
++#else
++__always_inline void TAS_set_coolest_as_idle(void)
++{
++	set_cpuidle_map(TAS_coolest_cpu * SMT_COEFF);
++}
++#endif
++
+ /*
+  * Resched current on rq. We don't know if rq is local to this CPU nor if it
+  * is locked so we do not use an intermediate variable for the task to avoid
+@@ -4302,12 +4331,12 @@ static void __sched notrace __schedule(bool preempt)
+ 	}
+ 
+ 	next = earliest_deadline_task(rq, cpu, idle);
+-	if (likely(next->prio != PRIO_LIMIT))
++
++	if (likely((cpu % SMT_COEFF * TAS_coolest_cpu) > 1)) {
+ 		clear_cpuidle_map(cpu);
+-	else {
+-		set_cpuidle_map(cpu);
+-		update_load_avg(rq, 0);
+ 	}
++	TAS_set_coolest_as_idle();
++	update_load_avg(rq, 0);
+ 
+ 	set_rq_task(rq, next);
+ 	next->last_ran = niffies;
+@@ -4320,8 +4349,12 @@ static void __sched notrace __schedule(bool preempt)
+ 			inc_nr_running(rq);
+ 			if (rt_task(next))
+ 				rq->rt_nr_running++;
+-		} else if (!deactivate)
++		} else if (!deactivate) {
++			#ifdef TAS_DEBUG
++			TAS_reschedules += 1;
++			#endif
+ 			resched_suitable_idle(prev);
++		}
+ 		if (unlikely(next == idle)) {
+ 			dec_nr_running(rq);
+ 			if (rt_task(prev))
